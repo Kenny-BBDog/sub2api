@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,59 @@ type SchedulerGroupLifecycleLease struct {
 
 func (l SchedulerGroupLifecycleLease) ValidFor(groupID int64) bool {
 	return groupID > 0 && l.GroupID == groupID && l.OwnerToken != ""
+}
+
+// schedulerPlatformSetSeparator joins a model-union platform set into the
+// single wire token a SchedulerBucket carries. "+" rather than ":" because
+// String/ParseSchedulerBucket split buckets on ":".
+const schedulerPlatformSetSeparator = "+"
+
+// SchedulerPlatformSetToken renders a platform set as one canonical bucket
+// token. A single platform keeps its plain form, so existing bucket keys — and
+// the Redis entries behind them — are unchanged.
+//
+// The order is fixed by sorting rather than taken from the caller: the same set
+// is produced both when a request resolves a union and when a background rebuild
+// derives one from the group's composite routes. Those two producers must agree
+// on the key exactly, or an invalidation would rebuild a bucket nobody reads and
+// leave the live one stale.
+func SchedulerPlatformSetToken(platforms []string) string {
+	trimmed := make([]string, 0, len(platforms))
+	seen := make(map[string]struct{}, len(platforms))
+	for _, platform := range platforms {
+		platform = strings.TrimSpace(platform)
+		if platform == "" {
+			continue
+		}
+		if _, dup := seen[platform]; dup {
+			continue
+		}
+		seen[platform] = struct{}{}
+		trimmed = append(trimmed, platform)
+	}
+	if len(trimmed) < 2 {
+		return strings.Join(trimmed, schedulerPlatformSetSeparator)
+	}
+	sort.Strings(trimmed)
+	return strings.Join(trimmed, schedulerPlatformSetSeparator)
+}
+
+// Platforms returns the platform set a bucket covers. A plain single-platform
+// bucket yields exactly one entry.
+func (b SchedulerBucket) Platforms() []string {
+	if !strings.Contains(b.Platform, schedulerPlatformSetSeparator) {
+		if b.Platform == "" {
+			return nil
+		}
+		return []string{b.Platform}
+	}
+	return strings.Split(b.Platform, schedulerPlatformSetSeparator)
+}
+
+// IsPlatformSet reports whether the bucket covers more than one platform, i.e.
+// it came from a model-union composite route.
+func (b SchedulerBucket) IsPlatformSet() bool {
+	return strings.Contains(b.Platform, schedulerPlatformSetSeparator)
 }
 
 type SchedulerBucket struct {

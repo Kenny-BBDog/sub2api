@@ -28,8 +28,15 @@ const (
 
 // CompositeModelOwnership identifies the concrete provider that exposes a
 // public model through an account-level exact mapping.
+//
+// Platforms carries the whole set when more than one platform exposes the
+// model and they all belong to the same gateway family; account selection then
+// draws from any of them. TargetPlatform still names the anchor (the single
+// platform every downstream consumer keeps using). A set that spans gateway
+// families stays unsupported and is reported through Ambiguous.
 type CompositeModelOwnership struct {
 	TargetPlatform string
+	Platforms      []string
 	Matched        bool
 	Ambiguous      bool
 	// OpenAIGatewayOAuthClaimed 表示声明方中含 OpenAI 网关族平台的 OAuth /
@@ -69,15 +76,20 @@ type CompositeRoutePreviewRequest struct {
 }
 
 type CompositeRouteDecision struct {
-	Matched        bool                 `json:"matched"`
-	Source         string               `json:"source"`
-	GroupID        int64                `json:"group_id"`
-	PublicModel    string               `json:"public_model"`
-	TargetPlatform string               `json:"target_platform"`
-	UpstreamModel  string               `json:"upstream_model"`
-	Endpoint       string               `json:"endpoint"`
-	Route          *CompositeModelRoute `json:"route,omitempty"`
-	Reason         string               `json:"reason,omitempty"`
+	Matched        bool   `json:"matched"`
+	Source         string `json:"source"`
+	GroupID        int64  `json:"group_id"`
+	PublicModel    string `json:"public_model"`
+	TargetPlatform string `json:"target_platform"`
+	// TargetPlatforms is the full same-family platform set when the model is
+	// exposed by several platforms. Empty (or a single entry) means the
+	// historical single-platform behaviour. TargetPlatform is always the
+	// anchor, i.e. TargetPlatforms[0] when the set is present.
+	TargetPlatforms []string             `json:"target_platforms,omitempty"`
+	UpstreamModel   string               `json:"upstream_model"`
+	Endpoint        string               `json:"endpoint"`
+	Route           *CompositeModelRoute `json:"route,omitempty"`
+	Reason          string               `json:"reason,omitempty"`
 }
 
 type CompositeRouteInput struct {

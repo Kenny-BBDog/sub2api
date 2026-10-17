@@ -37,6 +37,9 @@ func WithCompositeRouteDecision(ctx context.Context, decision CompositeRouteDeci
 		return ctx
 	}
 	ctx = WithResolvedTargetPlatform(ctx, decision.TargetPlatform)
+	if len(decision.TargetPlatforms) > 1 {
+		ctx = WithResolvedTargetPlatforms(ctx, decision.TargetPlatforms)
+	}
 	if model := strings.TrimSpace(decision.UpstreamModel); model != "" {
 		ctx = context.WithValue(ctx, ctxkey.ResolvedUpstreamModel, model)
 	}
@@ -47,6 +50,45 @@ func WithCompositeRouteDecision(ctx context.Context, decision CompositeRouteDeci
 		ctx = context.WithValue(ctx, ctxkey.CompositeRouteSource, source)
 	}
 	return ctx
+}
+
+// WithResolvedTargetPlatforms records the full same-gateway-family platform set
+// a composite request may draw accounts from. The slice is normalised (trimmed,
+// de-duplicated, order preserved) so callers can treat index 0 as the anchor.
+func WithResolvedTargetPlatforms(ctx context.Context, platforms []string) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	normalized := make([]string, 0, len(platforms))
+	seen := make(map[string]struct{}, len(platforms))
+	for _, platform := range platforms {
+		platform = strings.TrimSpace(platform)
+		if platform == "" {
+			continue
+		}
+		if _, dup := seen[platform]; dup {
+			continue
+		}
+		seen[platform] = struct{}{}
+		normalized = append(normalized, platform)
+	}
+	if len(normalized) < 2 {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxkey.ResolvedTargetPlatforms, normalized)
+}
+
+// ResolvedTargetPlatformsFromContext returns the platform set when the request
+// resolved to a model-union, i.e. more than one platform may serve it.
+func ResolvedTargetPlatformsFromContext(ctx context.Context) ([]string, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	platforms, ok := ctx.Value(ctxkey.ResolvedTargetPlatforms).([]string)
+	if !ok || len(platforms) < 2 {
+		return nil, false
+	}
+	return platforms, true
 }
 
 func ResolvedUpstreamModelFromContext(ctx context.Context) (string, bool) {
@@ -187,14 +229,19 @@ func (s *GatewayService) resolveCompositeRouteDecision(ctx context.Context, grou
 		if resolvedSource, sourceOK := CompositeRouteSourceFromContext(ctx); sourceOK {
 			source = resolvedSource
 		}
+		var platforms []string
+		if resolvedPlatforms, platformsOK := ResolvedTargetPlatformsFromContext(ctx); platformsOK {
+			platforms = resolvedPlatforms
+		}
 		return CompositeRouteDecision{
-			Matched:        true,
-			Source:         source,
-			GroupID:        group.ID,
-			PublicModel:    requestedModel,
-			TargetPlatform: platform,
-			UpstreamModel:  upstreamModel,
-			Endpoint:       normalizeCompositeRouteEndpoint(endpoint),
+			Matched:         true,
+			Source:          source,
+			GroupID:         group.ID,
+			PublicModel:     requestedModel,
+			TargetPlatform:  platform,
+			TargetPlatforms: platforms,
+			UpstreamModel:   upstreamModel,
+			Endpoint:        normalizeCompositeRouteEndpoint(endpoint),
 		}, true, nil
 	}
 	decision, err := s.compositeResolver.Resolve(ctx, group.ID, requestedModel, endpoint)
@@ -206,4 +253,36 @@ func (s *GatewayService) resolveCompositeRouteDecision(ctx context.Context, grou
 
 func isConcreteRequestPlatform(platform string) bool {
 	return domain.IsConcretePlatform(platform)
+}
+
+// compositePlatformsShareGatewayFamily reports whether every platform in the
+// set is served by the same gateway service.
+//
+// This is the precondition for pooling accounts across platforms for one
+// model: the request handler is chosen from the resolved platform *before* an
+// account is selected, so a union is only servable when one handler covers
+// every member. Platforms behind different gateways need the dispatch itself
+// to move after account selection, which is out of scope here.
+//
+// The comparison is on the gateway itself, not on "is it the OpenAI gateway":
+// anthropic and antigravity are both non-OpenAI yet are separate gateways.
+func compositePlatformsShareGatewayFamily(platforms []string) bool {
+	if len(platforms) < 2 {
+		return false
+	}
+	var anchorGateway domain.PlatformGateway
+	for _, platform := range platforms {
+		spec, ok := domain.LookupPlatform(strings.TrimSpace(platform))
+		if !ok {
+			return false
+		}
+		if anchorGateway == "" {
+			anchorGateway = spec.Gateway
+			continue
+		}
+		if spec.Gateway != anchorGateway {
+			return false
+		}
+	}
+	return true
 }

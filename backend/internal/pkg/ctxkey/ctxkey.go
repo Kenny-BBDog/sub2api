@@ -11,6 +11,11 @@ const (
 	// ResolvedTargetPlatform 是 composite 分组按请求模型解析出的真实目标平台。
 	ResolvedTargetPlatform Key = "ctx_resolved_target_platform"
 
+	// ResolvedTargetPlatforms 是同一请求可用的完整平台集合（同网关家族），
+	// 仅在该模型被多个平台暴露且可合并调度时存在。ResolvedTargetPlatform
+	// 始终是集合中的第一个（锚点）。选号由调度层按整个集合进行。
+	ResolvedTargetPlatforms Key = "ctx_resolved_target_platforms"
+
 	// ResolvedUpstreamModel 是 composite 分组将公开模型名解析到的上游模型名。
 	ResolvedUpstreamModel Key = "ctx_resolved_upstream_model"
 

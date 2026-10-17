@@ -490,9 +490,11 @@ func ProvideSchedulerSnapshotService(
 	outboxRepo SchedulerOutboxRepository,
 	accountRepo AccountRepository,
 	groupRepo GroupRepository,
+	compositeRouteRepo CompositeModelRouteRepository,
 	cfg *config.Config,
 ) *SchedulerSnapshotService {
 	svc := NewSchedulerSnapshotService(cache, outboxRepo, accountRepo, groupRepo, cfg)
+	svc.SetCompositeRouteRepository(compositeRouteRepo)
 	svc.Start()
 	return svc
 }

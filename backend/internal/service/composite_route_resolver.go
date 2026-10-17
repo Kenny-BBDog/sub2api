@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -112,20 +113,21 @@ func (r *CompositeRouteResolver) Resolve(ctx context.Context, groupID int64, mod
 		if err != nil {
 			return decision, fmt.Errorf("list composite routes: %w", err)
 		}
-		if route, ok := matchCompositeRoute(routes, model, endpoint); ok {
+		if route, unionPlatforms, matched := compositeRouteUnion(routes, model, endpoint); matched {
 			upstreamModel := strings.TrimSpace(route.UpstreamModel)
 			if upstreamModel == "" {
 				upstreamModel = model
 			}
 			return CompositeRouteDecision{
-				Matched:        true,
-				Source:         CompositeRouteSourceExplicit,
-				GroupID:        groupID,
-				PublicModel:    model,
-				TargetPlatform: route.TargetPlatform,
-				UpstreamModel:  upstreamModel,
-				Endpoint:       endpoint,
-				Route:          &route,
+				Matched:         true,
+				Source:          CompositeRouteSourceExplicit,
+				GroupID:         groupID,
+				PublicModel:     model,
+				TargetPlatform:  route.TargetPlatform,
+				TargetPlatforms: unionPlatforms,
+				UpstreamModel:   upstreamModel,
+				Endpoint:        endpoint,
+				Route:           &route,
 			}, nil
 		}
 	}
@@ -153,13 +155,14 @@ func (r *CompositeRouteResolver) Resolve(ctx context.Context, groupID int64, mod
 				return decision, nil
 			}
 			return CompositeRouteDecision{
-				Matched:        true,
-				Source:         CompositeRouteSourceAccount,
-				GroupID:        groupID,
-				PublicModel:    model,
-				TargetPlatform: platform,
-				UpstreamModel:  model,
-				Endpoint:       endpoint,
+				Matched:         true,
+				Source:          CompositeRouteSourceAccount,
+				GroupID:         groupID,
+				PublicModel:     model,
+				TargetPlatform:  platform,
+				TargetPlatforms: ownership.Platforms,
+				UpstreamModel:   model,
+				Endpoint:        endpoint,
 			}, nil
 		}
 	}
@@ -179,18 +182,77 @@ func (r *CompositeRouteResolver) Resolve(ctx context.Context, groupID int64, mod
 	return decision, nil
 }
 
+// compositeRouteCandidate carries the sort keys used to rank routes matching
+// one requested model. matchStrength, endpointWeight and prefixLen together
+// define a specificity tier: routes tied on all three are equally specific, and
+// that tier is what the model-union scheduler pools across platforms.
+type compositeRouteCandidate struct {
+	route          CompositeModelRoute
+	matchStrength  int
+	endpointWeight int
+	prefixLen      int
+}
+
 func matchCompositeRoute(routes []CompositeModelRoute, model, endpoint string) (CompositeModelRoute, bool) {
-	if len(routes) == 0 {
+	candidates := rankCompositeRouteCandidates(routes, model, endpoint)
+	if len(candidates) == 0 {
 		return CompositeModelRoute{}, false
 	}
+	return candidates[0].route, true
+}
 
-	type candidate struct {
-		route          CompositeModelRoute
-		matchStrength  int
-		endpointWeight int
-		prefixLen      int
+// compositeRouteUnion returns the winning route plus every other platform in
+// the same specificity tier, when that tier maps one public model to several
+// platforms behind a single gateway. platforms is nil for the historical
+// single-platform case (including a tier that spans gateway families, which is
+// not servable yet because the request handler is picked before an account is).
+//
+// matched must be used instead of testing the route for a zero value: routes
+// built in memory — and rows read back before an ID is assigned — legitimately
+// carry ID 0.
+func compositeRouteUnion(routes []CompositeModelRoute, model, endpoint string) (CompositeModelRoute, []string, bool) {
+	candidates := rankCompositeRouteCandidates(routes, model, endpoint)
+	if len(candidates) == 0 {
+		return CompositeModelRoute{}, nil, false
 	}
-	candidates := make([]candidate, 0, len(routes))
+	top := candidates[0]
+	anchor := strings.TrimSpace(top.route.TargetPlatform)
+	if !isConcreteRequestPlatform(anchor) {
+		return top.route, nil, true
+	}
+	seen := map[string]struct{}{anchor: {}}
+	platforms := []string{anchor}
+	for _, c := range candidates[1:] {
+		if c.matchStrength != top.matchStrength || c.endpointWeight != top.endpointWeight || c.prefixLen != top.prefixLen {
+			break
+		}
+		platform := strings.TrimSpace(c.route.TargetPlatform)
+		if !isConcreteRequestPlatform(platform) {
+			continue
+		}
+		if _, dup := seen[platform]; dup {
+			continue
+		}
+		seen[platform] = struct{}{}
+		platforms = append(platforms, platform)
+	}
+	if len(platforms) < 2 {
+		return top.route, nil, true
+	}
+	if !compositePlatformsShareGatewayFamily(platforms) {
+		slog.Warn("composite route union spans gateway families; keeping the winning route only",
+			"model", model, "anchor", anchor, "platforms", platforms)
+		return top.route, nil, true
+	}
+	return top.route, platforms, true
+}
+
+func rankCompositeRouteCandidates(routes []CompositeModelRoute, model, endpoint string) []compositeRouteCandidate {
+	if len(routes) == 0 {
+		return nil
+	}
+
+	candidates := make([]compositeRouteCandidate, 0, len(routes))
 	for _, route := range routes {
 		route.Endpoint = normalizeCompositeRouteEndpoint(route.Endpoint)
 		if route.Endpoint != endpoint && route.Endpoint != CompositeRouteEndpointAny {
@@ -222,7 +284,7 @@ func matchCompositeRoute(routes []CompositeModelRoute, model, endpoint string) (
 		if route.Endpoint == endpoint {
 			endpointWeight = 1
 		}
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, compositeRouteCandidate{
 			route:          route,
 			matchStrength:  matchStrength,
 			endpointWeight: endpointWeight,
@@ -230,7 +292,7 @@ func matchCompositeRoute(routes []CompositeModelRoute, model, endpoint string) (
 		})
 	}
 	if len(candidates) == 0 {
-		return CompositeModelRoute{}, false
+		return nil
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -249,5 +311,5 @@ func matchCompositeRoute(routes []CompositeModelRoute, model, endpoint string) (
 		}
 		return a.route.ID < b.route.ID
 	})
-	return candidates[0].route, true
+	return candidates
 }

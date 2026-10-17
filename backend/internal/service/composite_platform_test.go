@@ -83,28 +83,48 @@ func TestResolveCompositeModelOwnershipRequiresNonEmptyExactMappings(t *testing.
 	require.Equal(t, CompositeModelOwnership{TargetPlatform: PlatformGrok, Matched: true}, ownership)
 }
 
-func TestResolveCompositeModelOwnershipAllowsSamePlatformAndRejectsCrossPlatformAliases(t *testing.T) {
+func TestResolveCompositeModelOwnershipAllowsSamePlatformAndPoolsSameGateway(t *testing.T) {
 	groupID := int64(7)
 	repo := &compositeOwnershipAccountRepo{
 		accounts: []Account{
-			{ID: 1, Platform: PlatformOpenAI, Credentials: map[string]any{"model_mapping": map[string]any{"shared-openai": "gpt-5", "ambiguous": "gpt-5"}}},
+			{ID: 1, Platform: PlatformOpenAI, Credentials: map[string]any{"model_mapping": map[string]any{"shared-openai": "gpt-5", "shared-gateway": "gpt-5", "cross-gateway": "gpt-5"}}},
 			{ID: 2, Platform: PlatformOpenAI, Credentials: map[string]any{"model_mapping": map[string]any{"shared-openai": "gpt-5.1"}}},
-			{ID: 3, Platform: PlatformDeepseek, Credentials: map[string]any{"model_mapping": map[string]any{"ambiguous": "deepseek-v4-pro"}}},
+			{ID: 3, Platform: PlatformDeepseek, Credentials: map[string]any{"model_mapping": map[string]any{"shared-gateway": "deepseek-v4-pro"}}},
+			{ID: 4, Platform: PlatformAnthropic, Credentials: map[string]any{"model_mapping": map[string]any{"cross-gateway": "claude-fable-5-1"}}},
 		},
 	}
 	svc := &GatewayService{accountRepo: repo}
 
+	// Two accounts on one platform stay a single-platform answer.
 	samePlatform, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "shared-openai")
 	require.NoError(t, err)
 	require.Equal(t, CompositeModelOwnership{TargetPlatform: PlatformOpenAI, Matched: true}, samePlatform)
 
-	ambiguous, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "ambiguous")
+	// openai and deepseek sit behind the same gateway, so the model is pooled
+	// rather than refused: the anchor is the lowest-sorting platform so the
+	// answer does not depend on Go's map iteration order.
+	sameGateway, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "shared-gateway")
 	require.NoError(t, err)
-	require.Equal(t, CompositeModelOwnership{Ambiguous: true}, ambiguous)
+	require.True(t, sameGateway.Matched)
+	require.False(t, sameGateway.Ambiguous)
+	require.Equal(t, []string{PlatformDeepseek, PlatformOpenAI}, sameGateway.Platforms)
+	require.Equal(t, PlatformDeepseek, sameGateway.TargetPlatform)
+
+	// openai and anthropic are different gateways: still refused, because the
+	// request handler has to be chosen before an account is.
+	crossGateway, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "cross-gateway")
+	require.NoError(t, err)
+	require.Equal(t, CompositeModelOwnership{Ambiguous: true}, crossGateway)
 }
 
 // Scenario: 只有 OpenAI 网关族的 OAuth 声明方会被标记（API Key 上游可能兼容多协议，
 // Anthropic / Antigravity 的 OAuth 在默认 Anthropic handler 中可正常转发）
+//
+// 该标记只在「歧义」分支被消费：未解析的请求会按模型名前缀兜底选平台，兜底落到
+// OpenAI 网关族时，OpenAI 网关 OAuth 声明方会被误送进 Anthropic 管线。同网关家族的
+// 声明方现在被并集收编为 Matched，锚点必然落在同一网关族，请求直接交给该网关的
+// handler，不经过前缀兜底，所以那个误路由不可能发生。跨家族仍然 Ambiguous，兜底与
+// 标记的既有行为保持不变。
 func TestResolveCompositeModelOwnershipFlagsOpenAIGatewayOAuthClaimants(t *testing.T) {
 	groupID := int64(7)
 	repo := &compositeOwnershipAccountRepo{
@@ -119,14 +139,25 @@ func TestResolveCompositeModelOwnershipFlagsOpenAIGatewayOAuthClaimants(t *testi
 	}
 	svc := &GatewayService{accountRepo: repo}
 
+	// openai 与 deepseek 同属 OpenAI 网关族，并集调度；锚点是排序后的第一项。
 	withOAuth, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "gpt-6-astra")
 	require.NoError(t, err)
-	require.Equal(t, CompositeModelOwnership{Ambiguous: true, OpenAIGatewayOAuthClaimed: true}, withOAuth)
+	require.Equal(t, CompositeModelOwnership{
+		TargetPlatform:            PlatformDeepseek,
+		Platforms:                 []string{PlatformDeepseek, PlatformOpenAI},
+		Matched:                   true,
+		OpenAIGatewayOAuthClaimed: true,
+	}, withOAuth)
 
 	apiKeyOnly, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "apikey-only")
 	require.NoError(t, err)
-	require.Equal(t, CompositeModelOwnership{Ambiguous: true}, apiKeyOnly)
+	require.Equal(t, CompositeModelOwnership{
+		TargetPlatform: PlatformDeepseek,
+		Platforms:      []string{PlatformDeepseek, PlatformOpenAI},
+		Matched:        true,
+	}, apiKeyOnly)
 
+	// anthropic 与 antigravity 是两个网关，无法共用一个请求 handler：仍按歧义处理。
 	anthropicFamily, err := svc.resolveCompositeModelOwnership(context.Background(), groupID, "claude-opus-4-8")
 	require.NoError(t, err)
 	require.Equal(t, CompositeModelOwnership{Ambiguous: true}, anthropicFamily)

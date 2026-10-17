@@ -1532,12 +1532,29 @@ func (s *GatewayService) resolveCompositeModelOwnership(ctx context.Context, gro
 		}
 	}
 
-	if len(platforms) == 1 {
-		for platform := range platforms {
-			ownership.TargetPlatform = platform
-		}
+	// Sort before choosing an anchor: Go map iteration is randomised, and the
+	// anchor decides which platform every downstream consumer (pricing, channel
+	// mapping, error attribution) reports for the request.
+	ordered := make([]string, 0, len(platforms))
+	for platform := range platforms {
+		ordered = append(ordered, platform)
+	}
+	sort.Strings(ordered)
+
+	switch {
+	case len(ordered) == 1:
+		ownership.TargetPlatform = ordered[0]
 		ownership.Matched = true
-	} else if len(platforms) > 1 {
+	case len(ordered) > 1 && compositePlatformsShareGatewayFamily(ordered):
+		// Several platforms expose this model and they all sit behind the same
+		// gateway, so one request handler can serve any of them. Pool them
+		// rather than refusing: this is the "union by model" case.
+		ownership.TargetPlatform = ordered[0]
+		ownership.Platforms = ordered
+		ownership.Matched = true
+	case len(ordered) > 1:
+		// Mixed gateway families still need the handler to be chosen before an
+		// account is picked, which the request pipeline cannot do yet.
 		ownership.Ambiguous = true
 	}
 

@@ -124,6 +124,7 @@ type SchedulerSnapshotService struct {
 	outboxRepo                   SchedulerOutboxRepository
 	accountRepo                  AccountRepository
 	groupRepo                    GroupRepository
+	compositeRouteRepo           CompositeModelRouteRepository
 	cfg                          *config.Config
 	stopCh                       chan struct{}
 	stopOnce                     sync.Once
@@ -209,6 +210,12 @@ func (s *SchedulerSnapshotService) Stop() {
 }
 
 func (s *SchedulerSnapshotService) ListSchedulableAccounts(ctx context.Context, groupID *int64, platform string, hasForcePlatform bool) ([]Account, bool, error) {
+	// A model-union request resolves to a set of same-gateway-family platforms.
+	// Fold the set into the bucket token so it gets its own cache entry, and so
+	// loadAccountsFromDB queries every member of the set.
+	if platforms, ok := ResolvedTargetPlatformsFromContext(ctx); ok {
+		platform = SchedulerPlatformSetToken(platforms)
+	}
 	useMixed := (platform == PlatformAnthropic || platform == PlatformGemini) && !hasForcePlatform
 	mode := s.resolveMode(platform, hasForcePlatform)
 	bucket := s.bucketFor(groupID, platform, mode)
@@ -646,6 +653,12 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 		}
 		sort.Slice(platformGroupIDs, func(i, j int) bool { return platformGroupIDs[i] < platformGroupIDs[j] })
 		buckets = append(buckets, s.bucketsForPlatform(platform, platformGroupIDs, seen)...)
+		// A union bucket pools accounts from several platforms, so a change to any
+		// one member platform has to rebuild it too — the platform-scoped walk
+		// above can never reach a `a+b` bucket on its own.
+		for _, groupID := range platformGroupIDs {
+			buckets = append(buckets, s.unionBucketsForGroups(ctx, []int64{groupID}, platform)...)
+		}
 	}
 	return s.rebuildBuckets(ctx, buckets, "account_bulk_change")
 }
@@ -822,6 +835,9 @@ func (s *SchedulerSnapshotService) rebuildByAccount(ctx context.Context, account
 		buckets = append(buckets, s.bucketsForPlatform(PlatformAnthropic, groupIDs, seen)...)
 		buckets = append(buckets, s.bucketsForPlatform(PlatformGemini, groupIDs, seen)...)
 	}
+	// The account's own platform may take part in a model union, whose bucket this
+	// account now belongs to (or has just left).
+	buckets = append(buckets, s.unionBucketsForGroups(ctx, groupIDs, account.Platform)...)
 	return s.rebuildBuckets(ctx, buckets, reason)
 }
 
@@ -873,6 +889,7 @@ func (s *SchedulerSnapshotService) rebuildByGroupIDs(ctx context.Context, groupI
 	for _, platform := range schedulerSnapshotPlatforms() {
 		buckets = append(buckets, s.bucketsForPlatform(platform, groupIDs, seen)...)
 	}
+	buckets = append(buckets, s.unionBucketsForGroups(ctx, groupIDs, "")...)
 	return s.rebuildBuckets(ctx, buckets, reason)
 }
 
@@ -1499,6 +1516,20 @@ func (s *SchedulerSnapshotService) loadAccountsFromDB(ctx context.Context, bucke
 			filtered = append(filtered, acc)
 		}
 		return filtered, nil
+	}
+
+	// Model-union bucket: the request may be served by any platform in the set,
+	// so the candidate pool is their union. useMixed is always false here — a
+	// set token is never a bare anthropic/gemini platform name — so this branch
+	// and the mixed branch below cannot both apply.
+	if platforms := bucket.Platforms(); len(platforms) > 1 {
+		if groupID > 0 {
+			return s.accountRepo.ListSchedulableByGroupIDAndPlatforms(ctx, groupID, platforms)
+		}
+		if s.isRunModeSimple() {
+			return s.accountRepo.ListSchedulableByPlatforms(ctx, platforms)
+		}
+		return s.accountRepo.ListSchedulableUngroupedByPlatforms(ctx, platforms)
 	}
 
 	if groupID > 0 {

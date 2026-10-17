@@ -387,7 +387,12 @@ func isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx context.Context
 }
 
 func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) string {
-	platform = NormalizeOpenAICompatiblePlatform(platform)
+	// Normalisation maps anything that is not an OpenAI-gateway platform to
+	// "openai"; a model-union set token is not a registered platform, so it
+	// would be collapsed and every union member would then mismatch below.
+	if _, isUnion := ResolvedTargetPlatformsFromContext(ctx); !isUnion {
+		platform = NormalizeOpenAICompatiblePlatform(platform)
+	}
 	if account == nil {
 		return "account_nil"
 	}
@@ -401,7 +406,7 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 			return "account_model_not_owned"
 		}
 	}
-	if account.Platform != platform || !account.IsOpenAICompatible() {
+	if !accountServesRequestPlatforms(ctx, account, platform) || !account.IsOpenAICompatible() {
 		return "platform_mismatch"
 	}
 	if !account.IsSchedulableForModelWithContext(ctx, requestedModel) {
@@ -1498,8 +1503,17 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 }
 
 func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, groupID *int64, platform string) ([]Account, error) {
-	platform = NormalizeOpenAICompatiblePlatform(platform)
+	// A model-union request resolves to a same-gateway-family platform set. The
+	// set token is not a registered platform, so NormalizeOpenAICompatiblePlatform
+	// would collapse it to plain "openai" and silently drop the union; and the
+	// candidate pool has to be the union of every member, not the anchor alone.
+	unionPlatforms, isUnion := ResolvedTargetPlatformsFromContext(ctx)
+	if !isUnion {
+		platform = NormalizeOpenAICompatiblePlatform(platform)
+	}
 	if s.schedulerSnapshot != nil {
+		// The snapshot service reads the set from ctx itself, so passing the
+		// anchor here still yields a union bucket.
 		accounts, _, err := s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, platform, false)
 		if err != nil {
 			return accounts, err
@@ -1512,11 +1526,18 @@ func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, grou
 	}
 	var accounts []Account
 	var err error
-	if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple {
+	switch {
+	case isUnion && s.cfg != nil && s.cfg.RunMode == config.RunModeSimple:
+		accounts, err = s.accountRepo.ListSchedulableByPlatforms(ctx, unionPlatforms)
+	case isUnion && groupID != nil:
+		accounts, err = s.accountRepo.ListSchedulableByGroupIDAndPlatforms(ctx, *groupID, unionPlatforms)
+	case isUnion:
+		accounts, err = s.accountRepo.ListSchedulableUngroupedByPlatforms(ctx, unionPlatforms)
+	case s.cfg != nil && s.cfg.RunMode == config.RunModeSimple:
 		accounts, err = s.accountRepo.ListSchedulableByPlatform(ctx, platform)
-	} else if groupID != nil {
+	case groupID != nil:
 		accounts, err = s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, *groupID, platform)
-	} else {
+	default:
 		accounts, err = s.accountRepo.ListSchedulableUngroupedByPlatform(ctx, platform)
 	}
 	if err != nil {
